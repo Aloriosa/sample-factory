@@ -370,6 +370,9 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
                 if actor_critic.training:
                     actor_critic.eval()  # need to call this because we can be in serial mode
 
+                action_mask = (
+                    ensure_torch_tensor(obs.pop("action_mask")).to(self.device) if "action_mask" in obs else None
+                )
                 normalized_obs = prepare_and_normalize_obs(actor_critic, obs)
                 rnn_states = ensure_torch_tensor(rnn_states).to(self.device).float()
                 if getattr(self.cfg, 'core_memory', False):
@@ -387,7 +390,7 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
                                                  'history_seq': history_seq,
                                                  'action_seq': action_seq
                                                 }
-                policy_outputs = actor_critic(normalized_obs, rnn_states,
+                policy_outputs = actor_critic(normalized_obs, rnn_states, action_mask=action_mask,
                                               **actor_critic_additonal_inputs
                                              )
                 #print(f"actor critic policy_outputs")
