@@ -164,6 +164,14 @@ def add_rl_args(p: ArgumentParser):
         "If you train with V-trace recurrence should be equal to rollout length.",
     )
     p.add_argument(
+        "--mem_recurrence",
+        default=-1,
+        type=int,
+        help="Trajectory length for backpropagation through time for SRMT. "
+        "Default value (-1) sets recurrence to rollout length for RNNs and to 1 (no recurrence) for feed-forward nets. "
+        "If you train with V-trace recurrence should be equal to rollout length.",
+    )
+    p.add_argument(
         "--shuffle_minibatches",
         default=False,
         type=str2bool,
