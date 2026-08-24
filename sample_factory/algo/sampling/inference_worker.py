@@ -44,7 +44,6 @@ def init_inference_process(sf_context: SampleFactoryContext, worker: InferenceWo
     set_global_context(sf_context)
     log.info(f"{worker.object_id}\tpid {os.getpid()}\tparent {os.getppid()}")
 
-    # workers should ignore Ctrl+C because the termination is handled in the event loop by a special msg
     import signal as os_signal
 
     os_signal.signal(os_signal.SIGINT, os_signal.SIG_IGN)
@@ -86,7 +85,6 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
 
         self.buffer_mgr = buffer_mgr
 
-        # shallow copy
         self.traj_tensors: Dict[Device, TensorDict] = copy.copy(buffer_mgr.traj_tensors_torch)
         self.policy_output_tensors: Dict[Device, TensorDict] = copy.copy(buffer_mgr.policy_output_tensors_torch)
 
@@ -96,12 +94,6 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
 
         self.request_count = deque(maxlen=50)
 
-        # very conservative limit on the minimum number of requests to wait for
-        # this will almost guarantee that the system will continue collecting experience
-        # at max rate even when 2/3 of workers are stuck for some reason (e.g. doing a long env reset)
-        # Although if your workflow involves very lengthy operations that often freeze workers, it can be beneficial
-        # to set min_num_requests to 1 (at a cost of potential inefficiency, i.e. policy worker will use very small
-        # batches)
         min_num_requests = self.cfg.num_workers // (self.cfg.num_policies * self.cfg.policy_workers_per_policy)
         min_num_requests //= 3
         self.min_num_requests = max(1, min_num_requests)
@@ -118,10 +110,8 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
         self.report_timer: Optional[Timer] = None
         self.cache_cleanup_timer: Optional[Timer] = None
 
-        # flag used by the runner to determine when the worker is ready
         self.is_ready = False
 
-        # behavior configuration depending on whether we're in batched or non-batched sampling regime
         if cfg.batched_sampling:
             self._batch_func = self._batch_slices
             prepare_policy_outputs = self._prepare_policy_outputs_batched
@@ -158,7 +148,6 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
 
         self.param_client.on_weights_initialized(state_dict, self.device, policy_version)
 
-        # we can create and connect Timers and EventLoopObjects here because they all interact within one loop
         self.inference_loop = TightLoop(self.event_loop)
         self.inference_loop.iteration.connect(self._run)
 
@@ -169,7 +158,6 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
         if not self.cfg.benchmark:
             self.cache_cleanup_timer.timeout.connect(self._cache_cleanup)
 
-        # singal to main process (runner) that we're ready
         self.initialized.emit(self.policy_id, self.worker_idx)
 
         self.is_initialized = True
@@ -187,7 +175,6 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
             obs = dict()
             rnn_states = []
             for actor_idx, split_idx, traj_idx, device in self.requests:
-                # TODO: what should we do with data sampled on different devices
                 traj_tensors = self.traj_tensors[device]
                 dict_of_lists_append_idx(obs, traj_tensors["obs"], traj_idx)
                 rnn_states.append(traj_tensors["rnn_states"][traj_idx])
@@ -198,9 +185,6 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
                     obs[obs_key] = tensor_list[0]
                 rnn_states = rnn_states[0]
             else:
-                # cat() will fail if samples are on different devices
-                # should we handle a situation where experience comes from multiple devices?
-                # i.e. we use multiple GPUs for sampling but inference/learning is on a single GPU
                 dict_of_lists_cat(obs)
                 rnn_states = cat_tensors(rnn_states)
 
@@ -210,12 +194,11 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
         with timing.add_time("deserialize"):
             indices = []
             for request in self.requests:
-                # TODO: what should we do with data sampled on different devices
                 actor_idx, split_idx, request_data, device = request
                 for env_idx, agent_idx, traj_buffer_idx, rollout_step in request_data:
                     index = [traj_buffer_idx, rollout_step]
                     indices.append(index)
-
+                    
             indices = tuple(np.array(indices).T)
             traj_tensors = self.traj_tensors[device]  # TODO: multiple sampling devices?
             observations = traj_tensors["obs"][indices]
@@ -224,6 +207,9 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
             if getattr(self.cfg, 'core_memory', False):
                 agent_memory = traj_tensors["agent_memory"][indices]
                 global_memory = traj_tensors["global_memory"][indices]
+                env_agent_buffer_rollout_info = traj_tensors["env_agent_buffer_rollout_info"][indices]
+
+                
             if getattr(self.cfg, 'attn_core', False):
                 history_seq = traj_tensors["history_seq"][indices]
             if getattr(self.cfg, 'action_hist', False):
@@ -236,21 +222,23 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
             if getattr(self.cfg, 'core_memory', False):
                 agent_memory = ensure_torch_tensor(agent_memory)
                 global_memory = ensure_torch_tensor(global_memory)
+                env_agent_buffer_rollout_info = ensure_torch_tensor(env_agent_buffer_rollout_info)
             if getattr(self.cfg, 'attn_core', False):
                 history_seq = ensure_torch_tensor(history_seq)
             if getattr(self.cfg, 'action_hist', False):
                 action_seq = ensure_torch_tensor(action_seq)
         
-        additional_outputs = {}
+        additional_inputs = {}
         if getattr(self.cfg, 'core_memory', False):
-            additional_outputs['agent_memory'] = agent_memory
-            additional_outputs['global_memory'] = global_memory
+            additional_inputs['agent_memory'] = agent_memory
+            additional_inputs['global_memory'] = global_memory
+            additional_inputs['env_agent_buffer_rollout_info'] = env_agent_buffer_rollout_info
         if getattr(self.cfg, 'attn_core', False):
-            additional_outputs['history_seq'] = history_seq
+            additional_inputs['history_seq'] = history_seq
         if getattr(self.cfg, 'action_hist', False):
-            additional_outputs['action_seq'] = action_seq
+            additional_inputs['action_seq'] = action_seq
             
-        return observations, rnn_states, additional_outputs
+        return observations, rnn_states, additional_inputs
 
     @staticmethod
     def _unsqueeze_0dim_tensors(d: TensorDict):
@@ -261,16 +249,12 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
     def _prepare_policy_outputs_batched(
         self, num_samples: int, policy_outputs: TensorDict, requests: List
     ) -> AdvanceRolloutSignals:
-        # gotta unsqueeze some 0-dim tensors
         if num_samples <= 1:
             self._unsqueeze_0dim_tensors(policy_outputs)
 
-        # actions are handled differently in the batched version so we have to convert them to
-        # [batch_size, num_actions]
         if policy_outputs["actions"].ndim < 2:
             policy_outputs["actions"] = policy_outputs["actions"].unsqueeze(-1)
 
-        # assuming all workers provide the same number of samples
         samples_per_actor = num_samples // len(requests)
         ofs = 0
         devices_to_sync = set()
@@ -287,8 +271,6 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
             else:
                 signals_to_send[actor_idx] = [payload]
 
-        # to make sure we committed all writes to shared device memory, we need to sync all devices
-        # typically this will be a single CUDA device
         for device in devices_to_sync:
             synchronize(self.cfg, device)
 
@@ -297,16 +279,12 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
     def _prepare_policy_outputs_non_batched(
         self, _num_samples: int, policy_outputs: TensorDict, requests: List
     ) -> AdvanceRolloutSignals:
-        # Respect sampling device instead of just dumping everything on cpu?
-        # Although it is hard to imagine a scenario where we have a non-batched env with observations on gpu
         device = "cpu"
-        #print(f"inference worker policy_outputs = {policy_outputs['actions']}\n{policy_outputs['action_logits']}\n{self.buffer_mgr.output_names}")
-
+        
         with self.timing.add_time("to_cpu"):
             for key, output_value in policy_outputs.items():
                 policy_outputs[key] = output_value.to(device)
 
-        # concat all tensors into a single tensor for performance
         output_tensors = []
         for name in self.buffer_mgr.output_names:
             output_value = policy_outputs[name].float()
@@ -316,11 +294,7 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
                 output_tensors.append(output_value.flatten(start_dim=1))
             else:
                 output_tensors.append(output_value)
-        #print(f"inference worker names = {self.buffer_mgr.output_names}\noutput_tensors list {output_tensors}")
         output_tensors = torch.cat(output_tensors, dim=1)
-
-        #print(f"output_tensors after cat {output_tensors}")
-        
 
         signals_to_send: AdvanceRolloutSignals = dict()
         output_indices = []
@@ -336,11 +310,8 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
                 signals_to_send[actor_idx] = [payload]
 
         output_indices = tuple(np.array(output_indices).T)
-        #print(f"output_indices = {output_indices}") #output_tensors {output_tensors.shape}, 
-        #print(f"self.policy_output_tensors[device] = {self.policy_output_tensors[device].shape}")
         self.policy_output_tensors[device][output_indices] = output_tensors.numpy()
 
-        # this should be a no-op unless we have a non-batched env with observations on gpu
         synchronize(self.cfg, device)
 
         return signals_to_send
@@ -351,15 +322,17 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
             global_memory = None
             history_seq = None
             action_seq = None
+            env_agent_buffer_rollout_info = None
             if self.cfg.batched_sampling:
                 obs, rnn_states = self._batch_func(timing)
             else:
-                obs, rnn_states, additional_outputs = self._batch_func(timing)
+                obs, rnn_states, additional_inputs = self._batch_func(timing)
 
-                agent_memory = additional_outputs.get('agent_memory', None)
-                global_memory = additional_outputs.get('global_memory', None)
-                history_seq = additional_outputs.get('history_seq', None)
-                action_seq = additional_outputs.get('action_seq', None)
+                agent_memory = additional_inputs.get('agent_memory', None)
+                global_memory = additional_inputs.get('global_memory', None)
+                history_seq = additional_inputs.get('history_seq', None)
+                action_seq = additional_inputs.get('action_seq', None)
+                env_agent_buffer_rollout_info = additional_inputs.get('env_agent_buffer_rollout_info', None)
             
                 
             num_samples = rnn_states.shape[0]
@@ -368,34 +341,30 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
             with timing.add_time("obs_to_device_normalize"):
                 actor_critic = self.param_client.actor_critic
                 if actor_critic.training:
-                    actor_critic.eval()  # need to call this because we can be in serial mode
+                    actor_critic.eval()
 
-                action_mask = (
-                    ensure_torch_tensor(obs.pop("action_mask")).to(self.device) if "action_mask" in obs else None
-                )
                 normalized_obs = prepare_and_normalize_obs(actor_critic, obs)
                 rnn_states = ensure_torch_tensor(rnn_states).to(self.device).float()
                 if getattr(self.cfg, 'core_memory', False):
                     agent_memory = ensure_torch_tensor(agent_memory).to(self.device).float()
                     global_memory = ensure_torch_tensor(global_memory).to(self.device).float()
+                    env_agent_buffer_rollout_info = ensure_torch_tensor(env_agent_buffer_rollout_info).to(self.device).float()
                 if getattr(self.cfg, 'attn_core', False):
                     history_seq = ensure_torch_tensor(history_seq).to(self.device).float()
                 if getattr(self.cfg, 'action_hist', False):
                     action_seq = ensure_torch_tensor(action_seq).to(self.device).float()
 
-            with timing.add_time("forward"):
+            with timing.time_avg("forward_avg_1000", average=1000):
                 
                 actor_critic_additonal_inputs = {'agent_memory': agent_memory, 
                                                  'global_memory': global_memory,
                                                  'history_seq': history_seq,
-                                                 'action_seq': action_seq
+                                                 'action_seq': action_seq,
+                                                 'env_agent_buffer_rollout_info': env_agent_buffer_rollout_info
                                                 }
-                policy_outputs = actor_critic(normalized_obs, rnn_states, action_mask=action_mask,
+                policy_outputs = actor_critic(normalized_obs, rnn_states,
                                               **actor_critic_additonal_inputs
                                              )
-                #print(f"actor critic policy_outputs")
-                #for k, v in policy_outputs.items():
-                #    print(f"{k}: {v.shape}")
                 policy_outputs["policy_version"] = torch.empty([num_samples]).fill_(self.param_client.policy_version)
 
             with timing.add_time("prepare_outputs"):
