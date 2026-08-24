@@ -38,29 +38,22 @@ def init_tensor(leading_dimensions: List, tensor_type, tensor_shape, device: tor
         tensor_type = to_torch_dtype(tensor_type)
 
     tensor_shape = [x for x in tensor_shape if x]
-    #print('filter out dimensions with size 0')
     
     final_shape = leading_dimensions + list(tensor_shape)
     
-    # fill with magic values to make it easy to spot if we ever use unintialized data
-    #print(f"final shape {final_shape}")
     if rand:
-        t = torch.zeros(final_shape, dtype=tensor_type)#rand
+        t = torch.zeros(final_shape, dtype=tensor_type)
     else:
         t = torch.zeros(final_shape, dtype=tensor_type)
-        #print('zeros')    
         if t.is_floating_point():
             t.fill_(MAGIC_FLOAT)
         elif tensor_type in (torch.int, torch.int32, torch.int64, torch.int8, torch.uint8):
             t.fill_(MAGIC_INT)
-        #print('fill')
-    #print('to device')
+        
     t = t.to(device)
-    #print(f"param {param}")
     if param:
         t = torch.nn.Parameter(t)
 
-    # CUDA tensors are already shared by default
     if share and not t.is_cuda:
         t.share_memory_()
 
@@ -75,7 +68,6 @@ def action_info(env_info: EnvInfo) -> Tuple[int, int]:
 
 
 def policy_output_shapes(num_actions, num_action_distribution_parameters) -> List[Tuple[str, List]]:
-    # policy outputs, this matches the expected output of the actor-critic
     policy_outputs = [
         ("actions", [num_actions]),
         ("action_logits", [num_action_distribution_parameters]),
@@ -87,43 +79,45 @@ def policy_output_shapes(num_actions, num_action_distribution_parameters) -> Lis
 
 
 def alloc_trajectory_tensors(env_info: EnvInfo, num_traj, rollout, rnn_size, device, share,
-                             core_hidden_size=None, attn_core=False, core_mem=False, action_hist=False) -> TensorDict:
+                             core_hidden_size=None, attn_core=False, core_mem=False, action_hist=False,
+                            
+                             ) -> TensorDict:
     obs_space = env_info.obs_space
     num_agents = env_info.num_agents
     
     tensors = TensorDict()
 
-    # policy inputs
     tensors["obs"] = TensorDict()
     if not isinstance(obs_space, spaces.Dict):
         raise Exception("Only Dict observations spaces are supported")
 
-    # we need to allocate an extra rollout step here to calculate the value estimates for the last step
     for space_name, space in obs_space.spaces.items():
         tensors["obs"][space_name] = init_tensor([num_traj, rollout + 1], space.dtype, space.shape, device, share)
     tensors["rnn_states"] = init_tensor([num_traj, rollout + 1], torch.float32, [rnn_size], device, share)
     if core_mem:
-        tensors["agent_memory"] = init_tensor([num_traj, rollout], torch.float32, [1*core_hidden_size], device, share, rand=True, 
-                                              #param=True
+        tensors["agent_memory"] = init_tensor([num_traj, rollout + 1], torch.float32, [1*core_hidden_size], device, share, rand=True, 
+                                              
                                              )
-        #print(f'agent mem {num_agents}')
-        tensors["global_memory"] = init_tensor([num_traj, rollout], torch.float32, [num_agents*core_hidden_size], device, share, rand=True, 
-                                               #param=True
+        tensors["global_memory"] = init_tensor([num_traj, rollout + 1], torch.float32, [num_agents*core_hidden_size], device, share, rand=True, 
+                                               
                                               )
-        #print('glo mem')
+        tensors["env_agent_buffer_rollout_info"] = init_tensor([num_traj, rollout + 1], torch.float32, [3 + num_agents
+                                                                                                        ], device, share, rand=True, 
+                                               
+                                              )
 
     if attn_core:
-        tensors["history_seq"] = init_tensor([num_traj, rollout], torch.float32, [rollout*core_hidden_size], device, share, rand=False)
+        tensors["history_seq"] = init_tensor([num_traj, rollout + 1], torch.float32, 
+                                             [rollout*core_hidden_size], device, share, rand=False)
         tensors["history_seq"] = tensors["history_seq"].zero_()
     if action_hist:
-        tensors["action_seq"] = init_tensor([num_traj, rollout], torch.int32, [rollout*1], device, share, rand=False)
+        tensors["action_seq"] = init_tensor([num_traj, rollout + 1], torch.int32, [rollout*1], device, share, rand=False)
         tensors["action_seq"] = tensors["action_seq"].zero_()
     
 
     num_actions, num_action_distribution_parameters = action_info(env_info)
     policy_outputs = policy_output_shapes(num_actions, num_action_distribution_parameters)
 
-    # we need one more step to hold values for the last step
     outputs_with_extra_rollout_step = ["values"]
 
     for name, shape in policy_outputs:
@@ -131,7 +125,6 @@ def alloc_trajectory_tensors(env_info: EnvInfo, num_traj, rollout, rnn_size, dev
         rollout_len = rollout + 1 if name in outputs_with_extra_rollout_step else rollout
         tensors[name] = init_tensor([num_traj, rollout_len], torch.float32, shape, device, share)
 
-    # env outputs
     tensors["rewards"] = init_tensor([num_traj, rollout], torch.float32, [], device, share)
     tensors["rewards"].fill_(-42.42)  # if we're using uninitialized values by mistake it will be obvious
     tensors["dones"] = init_tensor([num_traj, rollout], torch.bool, [], device, share)
@@ -146,11 +139,11 @@ def alloc_trajectory_tensors(env_info: EnvInfo, num_traj, rollout, rnn_size, dev
     return tensors
 
 
-def alloc_policy_output_tensors(cfg, env_info: EnvInfo, rnn_size, device, share):
+def alloc_policy_output_tensors(cfg, env_info: EnvInfo, rnn_size, device, share, rollout):
     num_agents = env_info.num_agents
+
     envs_per_split = cfg.num_envs_per_worker // cfg.worker_num_splits
     core_hidden_size = cfg.core['core_hidden_size'] if getattr(cfg, 'attn_core', False) else None
-    #print(f"shared buffers core_hidden_size {type(core_hidden_size)}, {core_hidden_size}")
     policy_outputs_shape = [cfg.num_workers, cfg.worker_num_splits]
     if cfg.batched_sampling:
         policy_outputs_shape += [envs_per_split * num_agents]
@@ -159,13 +152,12 @@ def alloc_policy_output_tensors(cfg, env_info: EnvInfo, rnn_size, device, share)
 
     num_actions, num_action_distribution_parameters = action_info(env_info)
     policy_outputs = policy_output_shapes(num_actions, num_action_distribution_parameters)
-    policy_outputs += [("new_rnn_states", [rnn_size])]  # different name so we don't override current step rnn_state
+    policy_outputs += [("new_rnn_states", [rnn_size])]
     if cfg.core_memory:
-        #("abra", [3]),# set here the length of seq for your variable if != 1
-        policy_outputs += [("agent_new_memory", [1 * core_hidden_size])] # to distinguish old and new agent memory
-        policy_outputs += [("global_memory", [num_agents * core_hidden_size])] # havent changed so can be owerwritten
+         policy_outputs += [("agent_new_memory", [1 * core_hidden_size])] # to distinguish old and new agent memory
+        policy_outputs += [("new_global_memory", [num_agents * core_hidden_size])] # havent changed so can be owerwritten
     if cfg.attn_core:
-        policy_outputs += [("new_history_seq", [cfg.rollout * core_hidden_size])] # updates to last rollout observations
+        policy_outputs += [("new_history_seq", [rollout * core_hidden_size])] # updates to last rollout observations 
 
 
     output_names, output_shapes = list(zip(*policy_outputs))
@@ -176,10 +168,6 @@ def alloc_policy_output_tensors(cfg, env_info: EnvInfo, rnn_size, device, share)
         for name, shape in policy_outputs:
             policy_output_tensors[name] = init_tensor(policy_outputs_shape, torch.float32, shape, device, share)
     else:
-        # copying small policy outputs (e.g. individual value predictions & action logits) to shared memory is a
-        # bottleneck on the policy worker. For optimization purposes we create additional tensors to hold
-        # just concatenated policy outputs. Rollout workers parse the data and add it to the trajectory buffers
-        # in a proper format
         outputs_combined_size = sum(output_sizes)
         policy_output_tensors = init_tensor(policy_outputs_shape, torch.float32, [outputs_combined_size], device, share)
 
@@ -191,11 +179,10 @@ class BufferMgr(Configurable):
         super().__init__(cfg)
         self.env_info = env_info
 
+        
         self.buffers_per_device: Dict[Device, int] = dict()
 
         for i in range(cfg.num_workers):
-            # TODO: this should take into account whether we just need a GPU for sampling, or we actually receive observations on the GPU
-            # otherwise it will not work for things like Megaverse or GPU-rendered DMLab
             sampling_device = str(rollout_worker_device(i, cfg, self.env_info))
             log.debug(f"Rollout worker {i} uses device {sampling_device}")
 
@@ -203,7 +190,7 @@ class BufferMgr(Configurable):
             buffers_for_device = self.buffers_per_device.get(sampling_device, 0) + num_buffers
             self.buffers_per_device[sampling_device] = buffers_for_device
 
-        rnn_size = get_rnn_size(cfg)  # in case we have RNNs
+        rnn_size = get_rnn_size(cfg)
 
         self.trajectories_per_training_iteration = trajectories_per_training_iteration(cfg)
 
@@ -219,37 +206,28 @@ class BufferMgr(Configurable):
         share = not cfg.serial_mode
 
         if cfg.async_rl or cfg.num_policies > 1:
-            # One set of buffers to sample, one to learn from. Coefficient 2 seems appropriate here.
-            # Also: multi-policy training may require more buffers since some trajectories need to be sent
-            # to multiple workers.
             for device in self.buffers_per_device:
                 self.buffers_per_device[device] *= 2
         else:
-            # in synchronous mode we only allocate a single set of trajectories
-            # and they are not released until the learner finishes learning from them
             pass
 
-        # determine the number of minibatches we're allowed to accumulate before experience collection is halted
         self.max_batches_to_accumulate = cfg.num_batches_to_accumulate
         if not cfg.async_rl:
             log.debug("In synchronous mode, we only accumulate one batch. Setting num_batches_to_accumulate to 1")
             self.max_batches_to_accumulate = 1
 
-        # allocate trajectory buffers for sampling
         self.traj_buffer_queues: Dict[Device, MpQueue] = dict()
         self.traj_tensors_torch = dict()
         self.policy_output_tensors_torch = dict()
 
         for device, num_buffers in self.buffers_per_device.items():
-            # make sure that at the very least we have enough buffers to feed the learner
-            log.info('241')
+            
             num_buffers = max(
                 num_buffers,
                 self.max_batches_to_accumulate * self.trajectories_per_training_iteration * cfg.num_policies,
             )
-
+            log.info(f'241, num buffers {num_buffers}')
             self.traj_buffer_queues[device] = get_queue(cfg.serial_mode)
-
             self.traj_tensors_torch[device] = alloc_trajectory_tensors(
                 env_info,
                 num_buffers,
@@ -263,16 +241,14 @@ class BufferMgr(Configurable):
                 cfg.action_hist,
             )
             self.policy_output_tensors_torch[device], output_names, output_sizes = alloc_policy_output_tensors(
-                cfg, env_info, rnn_size, device, share
+                cfg, env_info, rnn_size, device, share, cfg.rollout
             )
             self.output_names, self.output_sizes = output_names, output_sizes
 
             if cfg.batched_sampling:
-                # big trajectory batches (slices) for batched sampling
                 for i in range(0, num_buffers, self.sampling_trajectories_per_iteration):
                     self.traj_buffer_queues[device].put(slice(i, i + self.sampling_trajectories_per_iteration))
             else:
-                # individual trajectories for more flexible non-batched sampling
                 for i in range(num_buffers):
                     self.traj_buffer_queues[device].put(i)
 
