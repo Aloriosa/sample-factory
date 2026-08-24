@@ -10,8 +10,6 @@ from sample_factory.utils.attr_dict import AttrDict
 from sample_factory.utils.typing import Config, ObsSpace
 from sample_factory.utils.utils import log
 
-
-# noinspection PyMethodMayBeStatic,PyUnusedLocal
 class Encoder(ModelModule):
     def __init__(self, cfg: Config):
         super().__init__(cfg)
@@ -73,12 +71,21 @@ class MlpEncoder(Encoder):
     def __init__(self, cfg: Config, obs_space: ObsSpace):
         super().__init__(cfg)
 
+        self.intra_num_agents = cfg.environment.get('intra_num_agents', 1)
+        
+       
+
         mlp_layers: List[int] = cfg.encoder_mlp_layers
-        self.mlp_head = create_mlp(mlp_layers, obs_space.shape[0], nonlinearity(cfg))
+        self.mlp_head = create_mlp(mlp_layers, obs_space.shape[0] // self.intra_num_agents, 
+                                   nonlinearity(cfg))
         if len(mlp_layers) > 0:
             self.mlp_head = torch.jit.script(self.mlp_head)
-        self.encoder_out_size = calc_num_elements(self.mlp_head, obs_space.shape)
+        
+        obs_space_shape = obs_space.shape
+        obs_space_shape = tuple([obs_space_shape[0] // self.intra_num_agents] + list(obs_space_shape[1:]))
 
+        self.encoder_out_size = calc_num_elements(self.mlp_head, obs_space_shape)
+        
     def forward(self, obs: Tensor):
         x = self.mlp_head(obs)
         return x
@@ -207,8 +214,7 @@ class ResnetEncoder(Encoder):
 
         self.mlp_layers = create_mlp(cfg.encoder_conv_mlp_layers, self.conv_head_out_size, activation)
 
-        # should we do torch.jit here?
-
+        
         self.encoder_out_size = calc_num_elements(self.mlp_layers, (self.conv_head_out_size,))
 
     def forward(self, obs: Tensor):
@@ -236,7 +242,4 @@ def default_make_encoder_func(cfg: Config, obs_space: ObsSpace) -> Encoder:
     Analyze the observation space and create either a convolutional or an MLP encoder depending on
     whether this is an image-based environment or environment with vector observations.
     """
-    # we only support dict observation spaces - envs with non-dict obs spaces use a wrapper
-    # main subspace used to determine the encoder type is called "obs". For envs with multiple subspaces,
-    # this function needs to be overridden (see vizdoom or dmlab encoders for example)
     return MultiInputEncoder(cfg, obs_space)
