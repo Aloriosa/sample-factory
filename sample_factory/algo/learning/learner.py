@@ -13,7 +13,7 @@ import torch
 from torch import Tensor
 from torch.nn import Module
 
-from sample_factory.algo.learning.rnn_utils import build_core_out_from_seq, build_rnn_inputs
+from sample_factory.algo.learning.rnn_utils import build_core_out_from_seq, build_rnn_inputs, build_srmt_inputs
 from sample_factory.algo.utils.action_distributions import get_action_distribution, is_continuous_action_space
 from sample_factory.algo.utils.env_info import EnvInfo
 from sample_factory.algo.utils.misc import LEARNER_ENV_STEPS, POLICY_ID_KEY, STATS_KEY, TRAIN_STATS, memory_stats
@@ -117,7 +117,6 @@ def get_lr_scheduler(cfg) -> LearningRateScheduler:
 def model_initialization_data(
     cfg: Config, policy_id: PolicyID, actor_critic: Module, policy_version: int, device: torch.device
 ) -> InitModelData:
-    # in serial mode we will just use the same actor_critic directly
     state_dict = None if cfg.serial_mode else actor_critic.state_dict()
     model_state = (policy_id, state_dict, device, policy_version)
     return model_state
@@ -201,24 +200,10 @@ class Learner(Configurable):
             log.info("Starting seed is not provided")
         else:
             log.info("Setting fixed seed %d", self.cfg.seed)
-            '''
-            os.environ["PYTHONHASHSEED"] = str(self.cfg.seed)
-            log.info(f"Setting PYTHONHASHSEED {os.environ.get('PYTHONHASHSEED', 'empty')}")
             
-            os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-            log.info(f"Setting torch seed {torch.get_rng_state()}")
-            #log.info(f"torch.seed() seed is {torch.seed()}")
-            # When running on the CuDNN backend, two further options must be set
-            torch.use_deterministic_algorithms(True)
-            torch.backends.cudnn.deterministic = True
-            torch.backends.cudnn.benchmark = False
-            
-            '''
             torch.manual_seed(self.cfg.seed)
             torch.cuda.manual_seed(self.cfg.seed)
-            # Set a fixed value for the hash seed
-            #np.random.seed(self.cfg.seed)
-            #random.seed(self.cfg.seed)
+            
         self._rnd = np.random.default_rng(self.cfg.seed)
         # initialize device
         self.device = policy_device(self.cfg, self.policy_id)
@@ -241,7 +226,9 @@ class Learner(Configurable):
         self.actor_critic.train()
 
         params = list(self.actor_critic.parameters())
-
+        if getattr(self.cfg, 'core_memory', False) and getattr(self.cfg, 'mem_recurrence', -1) != -1:                  
+            params.append(self.actor_critic.core.initial_agent_memory)
+        
         optimizer_cls = dict(adam=torch.optim.Adam, lamb=Lamb)
         if self.cfg.optimizer not in optimizer_cls:
             raise RuntimeError(f"Unknown optimizer {self.cfg.optimizer}")
@@ -250,7 +237,7 @@ class Learner(Configurable):
         log.debug(f"Using optimizer {optimizer_cls}")
 
         optimizer_kwargs = dict(
-            lr=self.cfg.learning_rate,  # use default lr only in ctor, then we use the one loaded from the checkpoint
+            lr=self.cfg.learning_rate,
             betas=(self.cfg.adam_beta1, self.cfg.adam_beta2),
         )
 
@@ -289,13 +276,11 @@ class Learner(Configurable):
         else:
             latest_checkpoint = checkpoints[-1]
 
-            # extra safety mechanism to recover from spurious filesystem errors
             num_attempts = 3
             for attempt in range(num_attempts):
-                # noinspection PyBroadException
                 try:
                     log.warning("Loading state from checkpoint %s...", latest_checkpoint)
-                    checkpoint_dict = torch.load(latest_checkpoint, map_location=device)
+                    checkpoint_dict = torch.load(latest_checkpoint, map_location=device, weights_only=False)
                     return checkpoint_dict
                 except Exception:
                     log.exception(f"Could not load from checkpoint, attempt {attempt}")
@@ -320,7 +305,6 @@ class Learner(Configurable):
         else:
             log.debug("Loading model from checkpoint")
 
-            # if we're replacing our policy with another policy (under PBT), let's not reload the env_steps
             self._load_state(checkpoint_dict, load_progress=load_progress)
 
     def _should_save_summaries(self):
@@ -359,8 +343,6 @@ class Learner(Configurable):
         if verbose:
             log.info("Saving %s...", filepath)
 
-        # This should protect us from a rare case where something goes wrong mid-save and we end up with a corrupted
-        # checkpoint file. It better be a corrupted temp file.
         torch.save(checkpoint, tmp_filepath)
         os.rename(tmp_filepath, filepath)
 
@@ -413,9 +395,6 @@ class Learner(Configurable):
                     self.cfg[key] = value
 
             if self.cfg.lr_schedule == "constant" and self.curr_lr != self.cfg.learning_rate:
-                # PBT-optimized learning rate, only makes sense if we use constant LR
-                # in case of more advanced LR scheduling we should update the parameters of the scheduler, not the
-                # learning rate directly
                 log.debug(f"Updating learning rate from {self.curr_lr} to {self.cfg.learning_rate}")
                 self.curr_lr = self.cfg.learning_rate
                 self._apply_lr(self.curr_lr)
@@ -429,13 +408,9 @@ class Learner(Configurable):
     def _maybe_load_policy(self) -> None:
         if self.policy_to_load is not None:
             with self.param_server.policy_lock:
-                # don't re-load progress if we are loading from another policy checkpoint
                 self.load_from_checkpoint(self.policy_to_load, load_progress=False)
 
-            # make sure everything (such as policy weights) is committed to shared device memory
             synchronize(self.cfg, self.device)
-            # this will force policy update on the inference worker (policy worker)
-            # we add max_policy_lag steps so that all experience currently in batches is invalidated
             self.train_step += self.cfg.max_policy_lag + 1
             self.policy_versions_tensor[self.policy_id] = self.train_step
 
@@ -516,14 +491,11 @@ class Learner(Configurable):
         minibatches_per_epoch = self.cfg.num_batches_per_epoch
 
         if minibatches_per_epoch == 1:
-            return [None]  # single minibatch is actually the entire buffer, we don't need indices
-
+            return [None]
         if self.cfg.shuffle_minibatches:
-            # indices that will start the mini-trajectories from the same episode (for bptt)
             indices = np.arange(0, experience_size, self.cfg.recurrence)
             indices = self._rnd.permutation(indices)
 
-            # complete indices of mini trajectories, e.g. with recurrence==4: [4, 16] -> [4, 5, 6, 7, 16, 17, 18, 19]
             indices = [np.arange(i, i + self.cfg.recurrence) for i in indices]
             indices = np.concatenate(indices)
 
@@ -533,16 +505,11 @@ class Learner(Configurable):
             minibatches = np.split(indices, num_minibatches)
         else:
             minibatches = list(slice(i * batch_size, (i + 1) * batch_size) for i in range(0, minibatches_per_epoch))
-
-            # this makes sense but I'd like to do some testing before enabling it
-            # random.shuffle(minibatches)  # same minibatches between epochs, but in random order
-
         return minibatches
 
     @staticmethod
     def _get_minibatch(buffer, indices):
         if indices is None:
-            # handle the case of a single batch, where the entire buffer is a minibatch
             return buffer
 
         mb = buffer[indices]
@@ -551,31 +518,26 @@ class Learner(Configurable):
     def _calculate_losses(
         self, mb: AttrDict, num_invalids: int
     ) -> Tuple[ActionDistribution, Tensor, Tensor | float, Optional[Tensor], Tensor | float, Tensor, Dict]:
+        
         with torch.no_grad(), self.timing.add_time("losses_init"):
             recurrence: int = self.cfg.recurrence
-
-            # PPO clipping
+            if self.cfg.mem_recurrence == -1:
+                mem_recurrence = self.cfg.rollout
+            else:
+                mem_recurrence = self.cfg.mem_recurrence
             clip_ratio_high = 1.0 + self.cfg.ppo_clip_ratio  # e.g. 1.1
-            # this still works with e.g. clip_ratio = 2, while PPO's 1-r would give negative ratio
             clip_ratio_low = 1.0 / clip_ratio_high
             clip_value = self.cfg.ppo_clip_value
 
             valids = mb.valids
-
-        # calculate policy head outside of recurrent loop
+            
         with self.timing.add_time("forward_head"):
-            #print(f"learner losses:\n")
-            #print(f"mb.normalized_obs = {[(k, v.shape) for k, v in mb.normalized_obs.items()]}")
             head_outputs = self.actor_critic.forward_head(mb.normalized_obs)
-            #print(f"enc out = {head_outputs.shape}")
             
             minibatch_size: int = head_outputs.size(0)
 
-        # initial rnn states
         with self.timing.add_time("bptt_initial"):
             if self.cfg.use_rnn:
-                # this is the only way to stop RNNs from backpropagating through invalid timesteps
-                # (i.e. experience collected by another policy)
                 done_or_invalid = torch.logical_or(mb.dones_cpu, ~valids.cpu()).float()
                 head_output_seq, rnn_states, inverted_select_inds = build_rnn_inputs(
                     head_outputs,
@@ -583,68 +545,157 @@ class Learner(Configurable):
                     mb.rnn_states,
                     recurrence,
                 )
-                #print(f"use rnn head_output_seq = {head_output_seq.data.shape}\nmb.rnn_states = {mb.rnn_states.shape}\nrnn_states = {rnn_states.shape}. mb.rnn_states[::recurrence] = {mb.rnn_states[::recurrence].shape}")
             else:
                 rnn_states = mb.rnn_states[::recurrence]
-            agent_memories = None
-            global_memories = None
-            history_seqs = None
-            action_seqs = None
-            if getattr(self.cfg, 'core_memory', False):
-                agent_memories = mb.agent_memory
-                global_memories = mb.global_memory
-                #print(f"\nlearner\nagent_memories: {agent_memories}\nglobal_memories: {global_memories}")
-            if getattr(self.cfg, 'attn_core', False):
-                history_seqs = mb.history_seq
-            if getattr(self.cfg, 'action_hist', False):
-                action_seqs = mb.action_seq
+                history_seqs = None
+                global_memories = None
+                env_agent_buffer_rollout_infos = None
 
-        # calculate RNN outputs for each timestep in a loop
+                if getattr(self.cfg, 'attn_core', False):
+                                        
+                    if getattr(self.cfg, 'core_memory', False):
+                        core_done_or_invalid = torch.logical_or(mb.dones_cpu, ~valids.cpu()).float()
+
+                        head_output_seq, history_seqs, env_agent_buffer_rollout_infos, start_agent_mememory_states, start_global_memory_states, inverted_select_inds, cpu_lengths = build_srmt_inputs(
+                            head_outputs, mb.history_seq, mb.env_agent_buffer_rollout_info,
+                            core_done_or_invalid, mb.agent_memory, mb.global_memory, mem_recurrence, 
+                            return_lengths=True)
+                        head_output_seq, head_output_seq_lens = torch.nn.utils.rnn.pad_packed_sequence(
+                                                                head_output_seq, 
+                                                               batch_first=True, 
+                                                               padding_value=0.0, 
+                                                               total_length=mem_recurrence
+                                                               )
+                        
+                        history_seqs, _ = torch.nn.utils.rnn.pad_packed_sequence(
+                                                               history_seqs, 
+                                                               batch_first=True, 
+                                                               padding_value=0.0, 
+                                                               total_length=mem_recurrence)
+                        
+                        env_agent_buffer_rollout_infos, _ = torch.nn.utils.rnn.pad_packed_sequence(
+                                                                env_agent_buffer_rollout_infos, 
+                                                               batch_first=True, 
+                                                               padding_value=-1,
+                                                               total_length=mem_recurrence)
+                        
+                    else:
+                        history_seqs = mb.history_seq
+
+
+        
+        action_seqs = None
+        if getattr(self.cfg, 'action_hist', False):
+            action_seqs = mb.action_seq
+        
+            
+        agent_mem_states_for_backward = [] 
         with self.timing.add_time("bptt"):
             if self.cfg.use_rnn:
                 with self.timing.add_time("bptt_forward_core"):
+                    
                     core_output_seq, _ = self.actor_critic.forward_core(head_output_seq, rnn_states)
-                    #print(f"use rnn core_output_seq = {core_output_seq.data.shape}")
                 core_outputs = build_core_out_from_seq(core_output_seq, inverted_select_inds)
                 
-                
-                #print(f"use rnn core_outputs = {core_outputs.shape}")
                 del core_output_seq
-                
+
             else:
-                if getattr(self.cfg, 'attn_core', None) == True:
-                    core_outputs, _, _ = self.actor_critic.forward_core(head_outputs, rnn_states,
-                                                                        agent_memory=agent_memories, 
-                                                                        global_memory=global_memories,
-                                                                        history_seq=history_seqs,
-                                                                        action_seq=action_seqs
-                                                                       )
+                if getattr(self.cfg, 'attn_core', False):
+                    with self.timing.add_time("attn_forward_core"):
+                        
+                        if getattr(self.cfg, 'core_memory', False): # and self.cfg.mem_recurrence != -1:
+                            
+                            head_outputs_elems = head_output_seq.split(1, dim=1)
+                            head_outputs_elems = [i.squeeze(1) for i in head_outputs_elems]
+                            history_seqs_elems = history_seqs.split(1, dim=1)
+                            history_seqs_elems = [i.squeeze(1) for i in history_seqs_elems]
+                            env_agent_buffer_rollout_info_elems = env_agent_buffer_rollout_infos.split(1, dim=1)
+                            env_agent_buffer_rollout_info_elems = [i.squeeze(1) for i in env_agent_buffer_rollout_info_elems]
+                            core_outputs_states = []
+                            state = start_agent_mememory_states
+                            global_state = start_global_memory_states
+                            state = state.detach()
+                            state.requires_grad = True
+                            global_state = global_state.detach()
+                            global_state.requires_grad = True
+                            global_state_indices = None
+                            for fwd_step, (ho, hi, 
+                                           inf) in enumerate(zip(head_outputs_elems, 
+                                                  history_seqs_elems,
+                                                  env_agent_buffer_rollout_info_elems
+                                                  )):
+                                
+                                core_out_elem, _, add_out = self.actor_critic.forward_core(
+                                                        ho,
+                                                        rnn_states=None,
+                                                        agent_memory=state,
+                                                        global_memory=global_state,
+                                                        history_seq=hi,
+                                                        action_seq=None,
+                                                        env_agent_buffer_rollout_info=inf,
+                                                        global_state_indices=global_state_indices,
+                                                    )
+                                if 'agent_new_memory' in add_out:
+                                    state = add_out['agent_new_memory']
+                                    global_state = add_out['new_global_memory']
+                                else:
+                                    print(f"no agent_new_memory in add_out")
+                                    assert False
+                                if 'global_state_indices' in add_out:
+                                    global_state_indices = add_out['global_state_indices']
+                                
+                                core_outputs_states.append(core_out_elem)
+                            core_outputs_states = torch.stack(core_outputs_states, dim=1).to(core_out_elem.device)
+                                
+                               
+                            packed_core_outputs_states = torch.nn.utils.rnn.pack_padded_sequence(
+                                core_outputs_states,
+                                head_output_seq_lens,
+                                batch_first=True,
+                                enforce_sorted=False
+                            )
+                            
+                            
+                            core_outputs = build_core_out_from_seq(packed_core_outputs_states,
+                                                                    inverted_select_inds)
+                            
+
+                            
+                                
+                        else:
+                            print(f"JUST ATTENTION")
+                            core_outputs, _, _ = self.actor_critic.forward_core(
+                                                            head_outputs, 
+                                                            rnn_states,
+                                                            agent_memory=None, 
+                                                            global_memory=None,
+                                                            history_seq=history_seqs,
+                                                            action_seq=action_seqs,
+                                                            env_agent_buffer_rollout_info=env_agent_buffer_rollout_infos
+                                                        )
+
                 else:
                     core_outputs, _ = self.actor_critic.forward_core(head_outputs, rnn_states)
                     
-            del head_outputs
+            
+            
 
         num_trajectories = minibatch_size // recurrence
         assert core_outputs.shape[0] == minibatch_size
 
         with self.timing.add_time("tail"):
-            # calculate policy tail outside of recurrent loop
             result = self.actor_critic.forward_tail(core_outputs, values_only=False, sample_actions=False)
             action_distribution = self.actor_critic.action_distribution()
             log_prob_actions = action_distribution.log_prob(mb.actions)
             ratio = torch.exp(log_prob_actions - mb.log_prob_actions)  # pi / pi_old
 
-            # super large/small values can cause numerical problems and are probably noise anyway
             ratio = torch.clamp(ratio, 0.05, 20.0)
 
             values = result["values"].squeeze()
 
-            del core_outputs
-
-        # these computations are not the part of the computation graph
+            
         with torch.no_grad(), self.timing.add_time("advantages_returns"):
             if self.cfg.with_vtrace:
-                # V-trace parameters
                 rho_hat = torch.Tensor([self.cfg.vtrace_rho])
                 c_hat = torch.Tensor([self.cfg.vtrace_c])
 
@@ -683,7 +734,6 @@ class Learner(Configurable):
                 targets = vs.to(self.device)
                 adv = adv.to(self.device)
             else:
-                # using regular GAE
                 adv = mb.advantages
                 targets = mb.returns
 
@@ -691,7 +741,6 @@ class Learner(Configurable):
             adv = (adv - adv_mean) / torch.clamp_min(adv_std, 1e-7)  # normalize advantage
 
         with self.timing.add_time("losses"):
-            # noinspection PyTypeChecker
             policy_loss = self._policy_loss(ratio, adv, clip_ratio_low, clip_ratio_high, valids, num_invalids)
             exploration_loss = self.exploration_loss_func(action_distribution, valids, num_invalids)
             kl_old, kl_loss = self.kl_loss_func(
@@ -710,7 +759,7 @@ class Learner(Configurable):
             adv_mean=adv_mean,
         )
 
-        return action_distribution, policy_loss, exploration_loss, kl_old, kl_loss, value_loss, loss_summaries
+        return action_distribution, policy_loss, exploration_loss, kl_old, kl_loss, value_loss, loss_summaries, agent_mem_states_for_backward
 
     def _train(
         self, gpu_buffer: TensorDict, batch_size: int, experience_size: int, num_invalids: int
@@ -722,7 +771,6 @@ class Learner(Configurable):
             prev_epoch_actor_loss = 1e9
             epoch_actor_losses = [0] * self.cfg.num_batches_per_epoch
 
-            # recent mean KL-divergences per minibatch, this used by LR schedulers
             recent_kls = []
 
             if self.cfg.with_vtrace:
@@ -733,11 +781,6 @@ class Learner(Configurable):
             num_sgd_steps = 0
             stats_and_summaries: Optional[AttrDict] = None
 
-            # When it is time to record train summaries, we randomly sample epoch/batch for which the summaries are
-            # collected to get equal representation from different stages of training.
-            # Half the time, we record summaries from the very large step of training. There we will have the highest
-            # KL-divergence and ratio of PPO-clipped samples, which makes this data even more useful for analysis.
-            # Something to consider: maybe we should have these last-batch metrics in a separate summaries category?
             with_summaries = self._should_save_summaries()
             if self._rnd.random() < 0.5:
                 summaries_epoch = self._rnd.integers(0, self.cfg.num_epochs)
@@ -747,8 +790,9 @@ class Learner(Configurable):
                 summaries_batch = self.cfg.num_batches_per_epoch - 1
 
             assert self.actor_critic.training
-
+        
         for epoch in range(self.cfg.num_epochs):
+            
             with timing.add_time("epoch_init"):
                 if early_stop:
                     break
@@ -759,12 +803,9 @@ class Learner(Configurable):
             for batch_num in range(len(minibatches)):
                 with torch.no_grad(), timing.add_time("minibatch_init"):
                     indices = minibatches[batch_num]
-
-                    # current minibatch consisting of short trajectory segments with length == recurrence
                     mb = self._get_minibatch(gpu_buffer, indices)
-                    #print(f"train mb {mb}")
-                    # enable syntactic sugar that allows us to access dict's keys as object attributes
                     mb = AttrDict(mb)
+                    
 
                 with timing.add_time("calculate_losses"):
                     (
@@ -775,10 +816,10 @@ class Learner(Configurable):
                         kl_loss,
                         value_loss,
                         loss_summaries,
+                        agent_mem_states,
                     ) = self._calculate_losses(mb, num_invalids)
 
                 with timing.add_time("losses_postprocess"):
-                    # noinspection PyTypeChecker
                     actor_loss: Tensor = policy_loss + exploration_loss + kl_loss
                     critic_loss = value_loss
                     loss: Tensor = actor_loss + critic_loss
@@ -796,13 +837,10 @@ class Learner(Configurable):
                             to_scalar(kl_loss),
                         )
 
-                        # perhaps something weird is happening, we definitely want summaries from this step
                         force_summaries = True
 
                 with torch.no_grad(), timing.add_time("kl_divergence"):
-                    # if kl_old is not None it is already calculated above
                     if kl_old is None:
-                        # calculate KL-divergence with the behaviour policy action distribution
                         old_action_distribution = get_action_distribution(
                             self.actor_critic.action_space,
                             mb.action_logits,
@@ -815,14 +853,14 @@ class Learner(Configurable):
                     if kl_old.numel() > 0 and kl_old.max().item() > 100:
                         log.warning(f"KL-divergence is very high: {kl_old.max().item():.4f}")
 
-                # update the weights
                 with timing.add_time("update"):
-                    # following advice from https://youtu.be/9mS1fIYj1So set grad to None instead of optimizer.zero_grad()
                     for p in self.actor_critic.parameters():
                         p.grad = None
-
+                    
                     loss.backward()
-
+                       
+                    
+                        
                     if self.cfg.max_grad_norm > 0.0:
                         with timing.add_time("clip"):
                             torch.nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.cfg.max_grad_norm)
@@ -831,9 +869,6 @@ class Learner(Configurable):
 
                     actual_lr = self.curr_lr
                     if num_invalids > 0:
-                        # if we have masked (invalid) data we should reduce the learning rate accordingly
-                        # this prevents a situation where most of the data in the minibatch is invalid
-                        # and we end up doing SGD with super noisy gradients
                         actual_lr = self.curr_lr * (experience_size - num_invalids) / experience_size
                     self._apply_lr(actual_lr)
 
@@ -983,58 +1018,49 @@ class Learner(Configurable):
 
     def _prepare_batch(self, batch: TensorDict) -> Tuple[TensorDict, int, int]:
         with torch.no_grad():
-            # create a shallow copy so we can modify the dictionary
-            # we still reference the same buffers though
-            #print(f"prepare batch {batch}")
             buff = shallow_recursive_copy(batch)
-            #print(f"buff = {buff}")
-
-            # ignore experience from other agents (i.e. on episode boundary) and from inactive agents
             valids: Tensor = buff["policy_id"] == self.policy_id
-            # ignore experience that was older than the threshold even before training started
             curr_policy_version: int = self.train_step
             buff["valids"][:, :-1] = valids & (curr_policy_version - buff["policy_version"] < self.cfg.max_policy_lag)
-            # for last T+1 step, we want to use the validity of the previous step
             buff["valids"][:, -1] = buff["valids"][:, -2]
 
-            # ensure we're in train mode so that normalization statistics are updated
             if not self.actor_critic.training:
                 self.actor_critic.train()
 
             buff["normalized_obs"] = self._prepare_and_normalize_obs(buff["obs"])
-            del buff["obs"]  # don't need non-normalized obs anymore
+            del buff["obs"]
 
-            # calculate estimated value for the next step (T+1)
             normalized_last_obs = buff["normalized_obs"][:, -1]
             
             agent_memory = None
             global_memory = None
             history_seq = None
             action_seq = None
+            env_agent_buffer_rollout_info = None
             if getattr(self.cfg, 'core_memory', False):
-                #print(f"prepare learner batch buff[agent_memory] = {buff['agent_memory'].shape}\nbuff[global_memory] = {buff['global_memory'].shape}\nbuff[rnn_states] = {buff['rnn_states'].shape}")
                 agent_memory = buff["agent_memory"][:, -1]
                 global_memory = buff["global_memory"][:, -1]
+                env_agent_buffer_rollout_info = buff["env_agent_buffer_rollout_info"][:, -1]
             if getattr(self.cfg, 'attn_core', False):
                 history_seq = buff["history_seq"][:, -1]
             if getattr(self.cfg, 'action_hist', False):
                 action_seq = buff["action_seq"][:, -1]
-
-            next_values = self.actor_critic(normalized_last_obs, buff["rnn_states"][:, -1], agent_memory=agent_memory, global_memory=global_memory, history_seq=history_seq, action_seq=action_seq,
+            
+            next_values = self.actor_critic(normalized_last_obs, buff["rnn_states"][:, -1], 
+                                            agent_memory=agent_memory,
+                                            global_memory=global_memory,
+                                            history_seq=history_seq,
+                                            action_seq=action_seq,
+                                            env_agent_buffer_rollout_info=env_agent_buffer_rollout_info,
                                             values_only=True)["values"]
             
 
             buff["values"][:, -1] = next_values
 
             if self.cfg.normalize_returns:
-                # Since our value targets are normalized, the values will also have normalized statistics.
-                # We need to denormalize them before using them for GAE caculation and value bootstrapping.
-                # rl_games PPO uses a similar approach, see:
-                # https://github.com/Denys88/rl_games/blob/7b5f9500ee65ae0832a7d8613b019c333ecd932c/rl_games/algos_torch/models.py#L51
                 denormalized_values = buff["values"].clone()  # need to clone since normalizer is in-place
                 self.actor_critic.returns_normalizer(denormalized_values, denormalize=True)
             else:
-                # values are not normalized in this case, so we can use them as is
                 denormalized_values = buff["values"]
 
             if self.cfg.value_bootstrap:
@@ -1063,13 +1089,20 @@ class Learner(Configurable):
                 buff["returns"] = buff["advantages"] + buff["valids"][:, :-1] * denormalized_values[:, :-1]
 
             # remove next step obs, rnn_states, and values from the batch, we don't need them anymore
-            for key in ["normalized_obs", "rnn_states", "values", "valids"]:
+            remove_additional_step_list = ["normalized_obs", "rnn_states", "values", "valids", 
+                         ]
+            if getattr(self.cfg, 'core_memory', False):
+                remove_additional_step_list += ["agent_memory", "global_memory", "env_agent_buffer_rollout_info"]
+            if getattr(self.cfg, 'attn_core', False):
+                remove_additional_step_list += ["history_seq"]
+            if getattr(self.cfg, 'action_hist', False):
+                remove_additional_step_list += ["action_seq"]
+
+            for key in remove_additional_step_list:
                 buff[key] = buff[key][:, :-1]
 
             dataset_size = buff["actions"].shape[0] * buff["actions"].shape[1]
             for d, k, v in iterate_recursively(buff):
-                #print(f"learner v {v.shape}, dataset_size = {dataset_size}")
-                # collapse first two dimensions (batch and time) into a single dimension
                 d[k] = v.reshape((dataset_size,) + tuple(v.shape[2:]))
 
             buff["dones_cpu"] = buff["dones"].to("cpu", copy=True, dtype=torch.float, non_blocking=True)
