@@ -2,10 +2,8 @@ from __future__ import annotations
 
 from typing import Dict, Optional
 
-import gymnasium as gym
 import torch
 from torch import Tensor, nn
-from torch.nn.utils.rnn import PackedSequence, pack_padded_sequence, pad_packed_sequence
 
 from sample_factory.algo.utils.action_distributions import is_continuous_action_space, sample_actions_log_probs
 from sample_factory.algo.utils.running_mean_std import RunningMeanStdInPlace, running_mean_std_summaries
@@ -27,15 +25,12 @@ class ActorCritic(nn.Module, Configurable):
         self.action_space = action_space
         self.encoders = []
 
-        # we make normalizers a part of the model, so we can use the same infrastructure
-        # to load/save the state of the normalizer (running mean and stddev statistics)
         self.obs_normalizer: ObservationNormalizer = ObservationNormalizer(obs_space, cfg)
 
         self.returns_normalizer: Optional[RunningMeanStdInPlace] = None
         if cfg.normalize_returns:
             returns_shape = (1,)  # it's actually a single scalar but we use 1D shape for the normalizer
             self.returns_normalizer = RunningMeanStdInPlace(returns_shape)
-            # comment this out for debugging (i.e. to be able to step through normalizer code)
             self.returns_normalizer = torch.jit.script(self.returns_normalizer)
 
         self.last_action_distribution = None  # to be populated after each forward step
@@ -54,8 +49,6 @@ class ActorCritic(nn.Module, Configurable):
 
     def model_to_device(self, device):
         for module in self.children():
-            # allow parts of encoders/decoders to be on different devices
-            # (i.e. text-encoding LSTM for DMLab is faster on CPU)
             if hasattr(module, "model_to_device"):
                 module.model_to_device(device)
             else:
@@ -71,23 +64,18 @@ class ActorCritic(nn.Module, Configurable):
         return self.encoders[0].type_for_input_tensor(input_tensor_name)
 
     def initialize_weights(self, layer):
-        # gain = nn.init.calculate_gain(self.cfg.nonlinearity)
         gain = self.cfg.policy_init_gain
 
         if hasattr(layer, "bias") and isinstance(layer.bias, torch.nn.parameter.Parameter):
             layer.bias.data.fill_(0)
 
         if self.cfg.policy_initialization == "orthogonal":
-            if type(layer) is nn.Conv2d or type(layer) is nn.Linear:
+            if type(layer) == nn.Conv2d or type(layer) == nn.Linear:
                 nn.init.orthogonal_(layer.weight.data, gain=gain)
             else:
-                # LSTMs and GRUs initialize themselves
-                # should we use orthogonal/xavier for LSTM cells as well?
-                # I never noticed much difference between different initialization schemes, and here it seems safer to
-                # go with default initialization,
                 pass
         elif self.cfg.policy_initialization == "xavier_uniform":
-            if type(layer) is nn.Conv2d or type(layer) is nn.Linear:
+            if type(layer) == nn.Conv2d or type(layer) == nn.Linear:
                 nn.init.xavier_uniform_(layer.weight.data, gain=gain)
             else:
                 pass
@@ -122,14 +110,10 @@ class ActorCritic(nn.Module, Configurable):
     def forward_core(self, head_output, rnn_states):
         raise NotImplementedError()
 
-    def forward_tail(
-        self, core_output, values_only: bool, sample_actions: bool, action_mask: Optional[Tensor] = None
-    ) -> TensorDict:
+    def forward_tail(self, core_output, values_only: bool, sample_actions: bool) -> TensorDict:
         raise NotImplementedError()
 
-    def forward(
-        self, normalized_obs_dict, rnn_states, values_only: bool = False, action_mask: Optional[Tensor] = None
-    ) -> TensorDict:
+    def forward(self, normalized_obs_dict, rnn_states, values_only: bool = False) -> TensorDict:
         raise NotImplementedError()
 
 
@@ -143,7 +127,6 @@ class ActorCriticSharedWeights(ActorCritic):
     ):
         super().__init__(obs_space, action_space, cfg)
 
-        # in case of shared weights we're using only a single encoder and a single core
         self.encoder = model_factory.make_model_encoder_func(cfg, obs_space)
         self.encoders = [self.encoder]  # a single shared encoder
 
@@ -166,6 +149,9 @@ class ActorCriticSharedWeights(ActorCritic):
                      global_memory=None,
                      history_seq=None,
                      action_seq=None,
+                     env_agent_buffer_rollout_info=None,
+                     values_only=False,
+                     global_state_indices=None,
                     ):
         
         if getattr(self.cfg, 'attn_core', None) == True:
@@ -173,14 +159,17 @@ class ActorCriticSharedWeights(ActorCritic):
                                                               agent_memory=agent_memory, 
                                                               global_memory=global_memory,
                                                               history_seq=history_seq,
-                                                              action_seq=action_seq
+                                                              action_seq=action_seq,
+                                                              env_agent_buffer_rollout_info=env_agent_buffer_rollout_info,
+                                                              values_only=values_only,
+                                                              global_state_indices=global_state_indices,
                                                              )
             return x, new_rnn_states, additional_outputs
         else:
             x, new_rnn_states = self.core(head_output, rnn_states)
             return x, new_rnn_states
         
-    def forward_tail(self, core_output, values_only: bool, sample_actions: bool, action_mask: Optional[Tensor] = None) -> TensorDict:
+    def forward_tail(self, core_output, values_only: bool, sample_actions: bool) -> TensorDict:
         decoder_output = self.decoder(core_output)
         values = self.critic_linear(decoder_output).squeeze()
 
@@ -188,50 +177,42 @@ class ActorCriticSharedWeights(ActorCritic):
         if values_only:
             return result
 
-        action_distribution_params, self.last_action_distribution = self.action_parameterization(decoder_output, action_mask)
+        action_distribution_params, self.last_action_distribution = self.action_parameterization(decoder_output)
 
-        # `action_logits` is not the best name here, better would be "action distribution parameters"
         result["action_logits"] = action_distribution_params
 
         self._maybe_sample_actions(sample_actions, result)
         return result
 
     def forward(self, normalized_obs_dict, rnn_states,
-                agent_memory=None, global_memory=None, history_seq=None, action_seq=None,
-                values_only=False, action_mask: Optional[Tensor] = None) -> TensorDict:
-        #print(f'\nactor critic input\nobs: {normalized_obs_dict}')#\nrnn_states = {rnn_states}\nagent_memory = {agent_memory}\nglobal_memory = {global_memory}')
+                agent_memory=None, global_memory=None, history_seq=None, action_seq=None, env_agent_buffer_rollout_info=None,
+                values_only=False) -> TensorDict:
         x = self.forward_head(normalized_obs_dict)
-        #print(f"actor_critic enc out {x.shape}, inp rnn states = {rnn_states.shape}")
         if getattr(self.cfg, 'attn_core', None) == True:
             x, new_rnn_states, additional_outputs = self.forward_core(x, rnn_states,
                                                                       agent_memory=agent_memory,
                                                                       global_memory=global_memory,
                                                                       history_seq=history_seq,
-                                                                      action_seq=action_seq
+                                                                      action_seq=action_seq,
+                                                                      env_agent_buffer_rollout_info=env_agent_buffer_rollout_info,
+                                                                      values_only=values_only
                                                                      )
         else:
             x, new_rnn_states = self.forward_core(x, rnn_states)
             additional_outputs = {}
-        #return x, new_rnn_states, additional_outputs
-
         agent_new_memory = additional_outputs.get('agent_new_memory', None)
-        global_memory = additional_outputs.get('global_memory', None)
+        new_global_memory = additional_outputs.get('new_global_memory', None)
         new_history_seq = additional_outputs.get('new_history_seq', None)
         
-        #print(f"core out x {x}")#core new rnn states = {new_rnn_states.shape}
-        result = self.forward_tail(x, values_only, sample_actions=True, action_mask=action_mask)
+        result = self.forward_tail(x, values_only, sample_actions=True)
         
         result["new_rnn_states"] = new_rnn_states
         if getattr(self.cfg, 'core_memory', None) == True:
             result["agent_new_memory"] = agent_new_memory
-            result["global_memory"] = global_memory
+            result["new_global_memory"] = new_global_memory
         if getattr(self.cfg, 'attn_core', None) == True:
             result["new_history_seq"] = new_history_seq
-        '''
-        print('\nactor critic output')
-        for rk, rv in result.items():
-            print(f"result {rk}: {rv}")
-        '''
+        
         return result
 
 
@@ -300,37 +281,28 @@ class ActorCriticSeparateWeights(ActorCritic):
     def forward_core(self, head_output, rnn_states):
         return self.core_func(head_output, rnn_states)
 
-    def forward_tail(
-        self, core_output, values_only: bool, sample_actions: bool, action_mask: Optional[Tensor] = None
-    ) -> TensorDict:
+    def forward_tail(self, core_output, values_only: bool, sample_actions: bool) -> TensorDict:
         core_outputs = core_output.chunk(len(self.cores), dim=1)
 
-        # second core output corresponds to the critic
         critic_decoder_output = self.critic_decoder(core_outputs[1])
         values = self.critic_linear(critic_decoder_output).squeeze()
 
         result = TensorDict(values=values)
         if values_only:
-            # this can be further optimized - we don't need to calculate actor head/core just to get values
             return result
 
-        # first core output corresponds to the actor
         actor_decoder_output = self.actor_decoder(core_outputs[0])
-        action_distribution_params, self.last_action_distribution = self.action_parameterization(
-            actor_decoder_output, action_mask
-        )
+        action_distribution_params, self.last_action_distribution = self.action_parameterization(actor_decoder_output)
 
         result["action_logits"] = action_distribution_params
 
         self._maybe_sample_actions(sample_actions, result)
         return result
 
-    def forward(
-        self, normalized_obs_dict, rnn_states, values_only=False, action_mask: Optional[Tensor] = None
-    ) -> TensorDict:
+    def forward(self, normalized_obs_dict, rnn_states, values_only=False) -> TensorDict:
         x = self.forward_head(normalized_obs_dict)
         x, new_rnn_states = self.forward_core(x, rnn_states)
-        result = self.forward_tail(x, values_only, sample_actions=True, action_mask=action_mask)
+        result = self.forward_tail(x, values_only, sample_actions=True)
         result["new_rnn_states"] = new_rnn_states
         return result
 
@@ -339,7 +311,6 @@ def default_make_actor_critic_func(cfg: Config, obs_space: ObsSpace, action_spac
     from sample_factory.algo.utils.context import global_model_factory
 
     model_factory = global_model_factory()
-    obs_space = obs_space_without_action_mask(obs_space)
 
     if cfg.actor_critic_share_weights:
         return ActorCriticSharedWeights(model_factory, obs_space, action_space, cfg)
@@ -348,17 +319,7 @@ def default_make_actor_critic_func(cfg: Config, obs_space: ObsSpace, action_spac
 
 
 def create_actor_critic(cfg: Config, obs_space: ObsSpace, action_space: ActionSpace) -> ActorCritic:
-    # check if user specified custom actor/critic creation function
     from sample_factory.algo.utils.context import global_model_factory
 
     make_actor_critic_func = global_model_factory().make_actor_critic_func
     return make_actor_critic_func(cfg, obs_space, action_space)
-
-
-def obs_space_without_action_mask(obs_space: ObsSpace) -> ObsSpace:
-    if isinstance(obs_space, gym.spaces.Dict) and "action_mask" in obs_space.spaces:
-        spaces = obs_space.spaces.copy()
-        del spaces["action_mask"]
-        obs_space = gym.spaces.Dict(spaces)
-
-    return obs_space
